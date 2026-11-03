@@ -1,0 +1,28 @@
+import assert from 'node:assert/strict';
+import {nativeCloudflarePlan} from './deployment-setup/native-cloudflare-plan.mjs';
+const {handoffNativeBuildCredential,nativeBuildCredential,cloudflareBuildPermissions,nativeBuildReceiverSecrets}=await import(process.env.FRONTBASE_BUILD_HANDOFF_MODULE||'./deployment-setup/native-build-handoff.mjs');
+const account='a'.repeat(32),project='build-fixture',owner='b'.repeat(64),token='private-build-fixture-token';
+const plan=nativeCloudflarePlan({assets:{binding:'ASSETS'}},{account,project,subdomain:'fixture',relay:'https://relay.example'});
+const auth={type:'api_token',token};let writes=0,seen;
+const read=async path=>path===''?{id:account}:[];
+const establish=async(context,grant)=>{writes++;seen={context,grant};return {returnPath:'/frontbase-bootstrap/activation#claim='+context.buildOwner};};
+const link=await handoffNativeBuildCredential(plan,auth,{read,establish,owner});
+assert.equal(link,'https://build-fixture.fixture.workers.dev/frontbase-bootstrap/activation#claim='+owner);
+assert.equal(writes,1);assert.equal(seen.context.target.account,account);assert.equal(seen.context.target.installationId,plan.vars.FRONTBASE_INSTALLATION_ID);assert.equal(seen.grant.accessToken,token);assert.deepEqual(seen.grant.scopes,[],'do not invent OAuth scopes for an API token');
+assert.deepEqual(seen.grant.capabilities,['vectorize']);
+await handoffNativeBuildCredential(plan,auth,{read:async path=>{if(path.startsWith('/vectorize/'))throw Error('optional permission absent');return read(path);},establish,owner});
+assert.deepEqual(seen.grant.capabilities,[],'optional permission failure does not advertise Vectorize or block the default installation');
+assert.ok(!JSON.stringify(plan).includes(token));assert.ok(!link.includes(token));
+for(const invalid of [{type:'oauth',token},{type:'api_key',token},{type:'api_token',token:''},null])assert.throws(()=>nativeBuildCredential(invalid),/native_build_api_token_required/);
+for(const probe of cloudflareBuildPermissions){writes=0;await assert.rejects(()=>handoffNativeBuildCredential(plan,auth,{read:async path=>{if(path===probe.path)throw Error('private upstream '+token);return read(path);},establish,owner}),error=>error.message==='native_build_permission_required: '+probe.permission&&!error.message.includes(token));assert.equal(writes,0);}
+writes=0;await assert.rejects(()=>handoffNativeBuildCredential(plan,auth,{read:async()=>({id:'c'.repeat(32)}),establish,owner}),/native_build_account_mismatch/);assert.equal(writes,0);
+for(const badOwner of ['short','Z'.repeat(64),'_'.repeat(64)])await assert.rejects(()=>handoffNativeBuildCredential(plan,auth,{read,establish,owner:badOwner}),/native_build_handoff_refused/);
+await assert.rejects(()=>handoffNativeBuildCredential({...plan,vars:{...plan.vars,FRONTBASE_BOOTSTRAP:'0'}},auth,{read,establish,owner}),/native_build_handoff_refused/);
+await assert.rejects(()=>handoffNativeBuildCredential(plan,auth,{read,establish:async()=>({returnPath:'https://attacker.example/#claim='+owner}),owner}),/native_build_handoff_unconfirmed/);
+writes=0;await assert.rejects(()=>handoffNativeBuildCredential(plan,auth,{read,establish:async()=>{writes++;throw Error('lost response');},owner}),/lost response/);assert.equal(writes,1,'never retry an uncertain provider write');
+const active={name:project,vars:{FRONTBASE_BOOTSTRAP:'0',FRONTBASE_PUBLIC_ORIGIN:'https://'+project+'.fixture.workers.dev',FRONTBASE_INSTALLATION_ID:plan.vars.FRONTBASE_INSTALLATION_ID}},old={bindings:[{name:'FRONTBASE_OAUTH_CONNECTIONS',type:'secret_text'},{name:'FRONTBASE_BOOTSTRAP_PROVIDER_TOKEN',type:'secret_text'}]};
+const upgraded=nativeBuildReceiverSecrets(active,old,'https://relay.example');assert.match(upgraded.FRONTBASE_OAUTH_RELAY_REGISTRATION_KEY,/^[\w-]{43}$/);assert.equal(upgraded.FRONTBASE_OAUTH_RELAY_ENROLL,'1');assert.equal(JSON.parse(upgraded.FRONTBASE_OAUTH_RELAY_TARGET).origin,active.vars.FRONTBASE_PUBLIC_ORIGIN);assert(!JSON.stringify(upgraded).includes(token));assert.equal(upgraded.SESSION_SECRET,undefined);
+for(const existing of ['FRONTBASE_OAUTH_RELAY_URL','FRONTBASE_OAUTH_RELAY_REGISTRATION_KEY'])assert.equal(nativeBuildReceiverSecrets(active,{bindings:[...old.bindings,{name:existing,type:'secret_text'}]},'https://relay.example'),undefined,'preserve existing relay configuration');
+assert.equal(nativeBuildReceiverSecrets(active,{bindings:[]},'https://relay.example'),undefined);assert.equal(nativeBuildReceiverSecrets(plan,old,'https://relay.example'),undefined);
+assert.throws(()=>nativeBuildReceiverSecrets({...active,name:'wrong-project'},old,'https://relay.example'));assert.throws(()=>nativeBuildReceiverSecrets(active,old,'http://relay.example'));
+console.log('PASS native build handoff and receiver upgrade: persistent credential, permission preflight, private owner capability, exact-origin admission, no credential/session-key transfer, existing relay preservation and no replay');

@@ -1,0 +1,90 @@
+import assert from 'node:assert/strict';
+import {mkdtempSync,existsSync,readFileSync,writeFileSync,readdirSync,mkdirSync} from 'node:fs';
+import {tmpdir} from 'node:os';import {join,resolve} from 'node:path';import {randomUUID,randomBytes,createHash} from 'node:crypto';
+const {createDockerBootstrapHost}=await import(process.env.FRONTBASE_DOCKER_HOST_TEST_MODULE||new URL('./deployment-setup/docker-bootstrap-host.mjs',import.meta.url).href);
+import {defaultDeploymentManifest} from '../packages/edge-core/dist/deployment.js';
+const directory=mkdtempSync(join(tmpdir(),'fb-host-')),origin='https://bootstrap.example';
+const env={FRONTBASE_BOOTSTRAP:'1',FRONTBASE_PUBLIC_ORIGIN:origin,FRONTBASE_BOOTSTRAP_DIRECTORY:resolve(directory),FRONTBASE_INSTALLATION_ID:randomUUID(),FRONTBASE_BOOTSTRAP_TOKEN:randomBytes(32).toString('hex'),FRONTBASE_BOOTSTRAP_EXPIRES_AT:new Date(Date.now()+3600000).toISOString()};
+if(process.env.HOSTED_DOCKER_RELAY==='1'){env.FRONTBASE_OAUTH_RELAY_URL='https://relay.example';env.FRONTBASE_OAUTH_RELAY_TARGET=JSON.stringify({origin,host:'docker',purpose:'connect'});}
+let boots=0,values;const boot=async e=>{boots++;values=e;return {engine:{fetch:async()=>new Response('private',{status:401})}};};
+const options={env,boot,assets:{'/frontbase-bootstrap/':{body:'Setup',type:'text/html'}}};
+await assert.rejects(createDockerBootstrapHost({...options,env:{...env,FRONTBASE_BOOTSTRAP:'0'}}),/explicit_bootstrap/);
+await assert.rejects(createDockerBootstrapHost({...options,env:{...env,APP_DB_URL:'libsql://existing.example'}}),/configured_environment/);
+const host=await createDockerBootstrapHost(options);assert.equal(boots,0);assert.equal(existsSync(join(directory,'runtime.json')),false);
+let cookie;const request=async(path,body,authenticated=true)=>host.fetch(new Request(origin+'/frontbase-bootstrap/'+path,{method:body===undefined?'GET':'POST',headers:{origin,'content-type':'application/json',...(authenticated&&cookie?{cookie}:{})},body:body===undefined?undefined:JSON.stringify(body)}));
+assert.equal((await request('api/configuration')).status,403);assert.equal((await request('')).status,200);
+assert.equal((await host.fetch(new Request('https://wrong.example/frontbase-bootstrap/'))).status,403);
+const claim=await request('api/claim',{token:env.FRONTBASE_BOOTSTRAP_TOKEN});assert.equal(claim.status,200);cookie=claim.headers.get('set-cookie').split(';')[0];
+if(process.env.HOSTED_DOCKER_RELAY==='1'){const previous=globalThis.fetch;try{globalThis.fetch=async input=>{assert.equal(String(input),'https://relay.example/health');return Response.json({providers:['cloudflare']});};const status=await host.fetch(new Request(origin+'/api/provider-oauth/status',{headers:{cookie}}));assert.equal(status.status,200);assert.equal((await status.json()).providers[0].available,true);const started=await host.fetch(new Request(origin+'/api/provider-oauth/cloudflare/start',{method:'POST',headers:{origin,cookie,'content-type':'application/json'},body:JSON.stringify({returnPath:'/frontbase-bootstrap/'})}));assert.equal(started.status,200);assert.equal(new URL((await started.json()).url).origin,'https://relay.example');}finally{globalThis.fetch=previous;}}
+const manifest=defaultDeploymentManifest('docker');assert.equal(manifest.bindings['state-db'].adapterId,'sqlite-file');
+const review=await request('api/review',{manifest});assert.equal(review.status,200);const {reviewId}=await review.json();
+const applied=await request('api/apply',{reviewId,credentials:{}});assert.equal(applied.status,200);const result=await applied.json();assert.equal(result.phase,'active');assert.ok(result.nextSetup.startsWith('/setup#/setup?claim='));assert.equal(boots,1);assert.ok(values.APP_DB_URL.endsWith('/application.db'));assert.ok(values.SESSION_SECRET);assert.equal(values.ADMIN_PASSWORD,undefined);if(process.env.HOSTED_DOCKER_RELAY==='1')assert.equal(values.FRONTBASE_OAUTH_RELAY_URL,'https://relay.example');
+assert.equal((await request('api/claim',{token:env.FRONTBASE_BOOTSTRAP_TOKEN})).status,410);
+const receipt=await host.journal.read(host.context);assert.ok(!JSON.stringify(receipt).includes(values.SETUP_TOKEN));
+const restarted=await createDockerBootstrapHost({...options,env:{...env,FRONTBASE_BOOTSTRAP_EXPIRES_AT:'expired',FRONTBASE_BOOTSTRAP_TOKEN:''}});assert.equal(boots,2);assert.equal((await restarted.fetch(new Request(origin+'/frontbase-bootstrap/'))).status,410);assert.equal((await restarted.fetch(new Request(origin+'/api/auth/me'))).status,401);
+await assert.rejects(createDockerBootstrapHost({...options,boot:async()=>{throw Error('db unavailable');}}),/db unavailable/);
+await assert.rejects(createDockerBootstrapHost({...options,env:{...env,FRONTBASE_INSTALLATION_ID:randomUUID()}}),/identity/);
+const separate=mkdtempSync(join(tmpdir(),'fb-existing-'));writeFileSync(join(separate,'application.db'),'existing');const guarded=await createDockerBootstrapHost({...options,env:{...env,FRONTBASE_BOOTSTRAP_DIRECTORY:resolve(separate)}});await assert.rejects(guarded.executor.preflight(guarded.context,manifest),/existing_state/);
+const failureDir=mkdtempSync(join(tmpdir(),'fb-failed-'));const failed=await createDockerBootstrapHost({...options,env:{...env,FRONTBASE_BOOTSTRAP_DIRECTORY:resolve(failureDir)},boot:async()=>{throw Error('database_unavailable');}});
+const {reviewBootstrap,applyBootstrap,reconcileBootstrap}=await import('../packages/edge-core/dist/deployment-bootstrap.js');const pending=await reviewBootstrap(failed.context,manifest,failed.journal,failed.executor);const uncertain=await applyBootstrap(failed.context,pending.operationId,{},failed.journal,failed.executor);assert.equal(uncertain.phase,'uncertain');assert.equal((await reconcileBootstrap(failed.context,failed.journal,failed.executor)).phase,'uncertain');await assert.rejects(reviewBootstrap(failed.context,manifest,failed.journal,failed.executor));assert.ok(existsSync(join(failureDir,'runtime.json')));
+await assert.rejects(createDockerBootstrapHost({...options,env:{...env,FRONTBASE_BOOTSTRAP_DIRECTORY:resolve(failureDir)},boot:async()=>{throw Error('database_unavailable');}}),/database_unavailable/);
+// Supabase create/reuse provisions through the Management API and lowers the minted scoped
+// role; the operator token never reaches the runtime volume, and provisioned state skips the
+// generic external probe (its DDL preflight verified emptiness already).
+const supaDir=mkdtempSync(join(tmpdir(),'fb-supa-'));
+const apiCalls=[];
+const fetchState=async(url,init)=>{apiCalls.push({url,init});const query=JSON.parse(init.body).query;
+ if(query.includes('FROM pg_tables'))return {status:200,json:async()=>[]};
+ if(query.includes('FROM information_schema.schemata'))return {status:200,json:async()=>[{schema_name:'present'}]};
+ return {status:200,json:async()=>[]};};
+let supaValues;const supaBoot=async e=>{supaValues=e;return {engine:{fetch:async()=>new Response('private',{status:401})}};};
+const supaHost=await createDockerBootstrapHost({env:{...env,FRONTBASE_BOOTSTRAP_DIRECTORY:resolve(supaDir)},boot:supaBoot,assets:options.assets,fetchState,probeExternal:async()=>{throw Error('provisioned state must not re-probe');}});
+const supaRequest=async(path,body,authenticated=true)=>supaHost.fetch(new Request(origin+'/frontbase-bootstrap/'+path,{method:body===undefined?'GET':'POST',headers:{origin,'content-type':'application/json',...(authenticated&&supaCookie?{cookie:supaCookie}:{})},body:body===undefined?undefined:JSON.stringify(body)}));
+let supaCookie;const supaClaim=await supaRequest('api/claim',{token:env.FRONTBASE_BOOTSTRAP_TOKEN},false);assert.equal(supaClaim.status,200);supaCookie=supaClaim.headers.get('set-cookie').split(';')[0];
+const supaManifest=defaultDeploymentManifest('docker');
+supaManifest.bindings['state-db']={adapterId:'supabase-postgres',mode:'create',config:{projectRef:'dockerproj',schema:'frontbase_edge_docker_state'},secretRefs:{token:'state/token'}};
+const supaReview=await supaRequest('api/review',{manifest:supaManifest});assert.equal(supaReview.status,200,'supabase create passes wizard review');const {reviewId:supaReviewId}=await supaReview.json();
+const supaApplied=await supaRequest('api/apply',{reviewId:supaReviewId,credentials:{'state/token':'sbp_docker_fixture'}});assert.equal(supaApplied.status,200);assert.equal((await supaApplied.json()).phase,'active','provisioned apply must reach an active installation');
+assert.match(supaValues.APP_DB_URL,/^postgres:\/\/frontbase_edge_docker_state_role:[^@]+@db\.dockerproj\.supabase\.co:5432\/postgres$/);
+assert.equal(apiCalls.length,2);assert.equal(apiCalls[0].init.headers.authorization,'Bearer sbp_docker_fixture');
+assert.ok(!readFileSync(join(supaDir,'runtime.json'),'utf8').includes('sbp_docker_fixture'),'operator token never reaches the runtime volume');
+// OAuth grant path: the hosted bootstrap resolves 'oauth/supabase/token' from the actor's stored
+// supabase connection — refresh-before-use through the vault rotation — and the refreshed
+// Management token reaches only the provisioning API headers: never argv, volume or journal.
+const grantToken='refreshed-apply-management-token';
+const {createSecretCipher}=await import('../packages/backend/dist/index.js');
+const supaGrantDir=mkdtempSync(join(tmpdir(),'fb-supa-oauth-'));
+const grantEnv={...env,FRONTBASE_BOOTSTRAP_DIRECTORY:resolve(supaGrantDir),FRONTBASE_SUPABASE_OAUTH_CLIENT_ID:'sb-apply-client',FRONTBASE_SUPABASE_OAUTH_CLIENT_SECRET:'sb-apply-secret'};
+const grantCipher=await createSecretCipher(env.FRONTBASE_BOOTSTRAP_TOKEN);
+const grantCalls=[];
+const grantFetchState=async(url,init)=>{grantCalls.push({url,init});const query=JSON.parse(init.body).query;
+ if(query.includes('FROM pg_tables'))return {status:200,json:async()=>[]};
+ return {status:200,json:async()=>[]};};
+let grantValues;const grantBoot=async e=>{grantValues=e;return {engine:{fetch:async()=>new Response('private',{status:401})}};};
+const grantHost=await createDockerBootstrapHost({env:grantEnv,boot:grantBoot,assets:options.assets,fetchState:grantFetchState,probeExternal:async()=>{throw Error('provisioned state must not re-probe');}});
+mkdirSync(join(supaGrantDir,'oauth'),{recursive:true,mode:0o700});
+writeFileSync(join(supaGrantDir,'oauth',createHash('sha256').update('connection:apply-grant').digest('hex')+'.json'),JSON.stringify({key:'connection:apply-grant',value:await grantCipher.encrypt(JSON.stringify({actor:{tenant:'_root',subject:env.FRONTBASE_INSTALLATION_ID},authorization:{provider:'supabase',accessToken:'expiring-apply-token',refreshToken:'expiring-apply-refresh',expiresAt:Date.now()+1000,scopes:['projects.read','database.write'],accounts:[{id:'dockerproj',name:'Docker project'}]},createdAt:Date.now()}))}),{mode:0o600});
+const walkVolume=directory=>readdirSync(directory,{withFileTypes:true}).flatMap(entry=>entry.isDirectory()?walkVolume(join(directory,entry.name)):[join(directory,entry.name)]);
+let grantCookie,refreshBodies=[];
+const previousFetch=globalThis.fetch;globalThis.fetch=async(url,init)=>{assert.equal(String(url),'https://api.supabase.com/v1/oauth/token');refreshBodies.push(new URLSearchParams(init.body));return Response.json({access_token:grantToken,refresh_token:'rotated-apply-refresh',token_type:'bearer',expires_in:3600});};
+let grantApplied;
+try{
+ const grantRequest=async(path,body,authenticated=true)=>grantHost.fetch(new Request(origin+'/frontbase-bootstrap/'+path,{method:body===undefined?'GET':'POST',headers:{origin,'content-type':'application/json',...(authenticated&&grantCookie?{cookie:grantCookie}:{})},body:body===undefined?undefined:JSON.stringify(body)}));
+ const grantClaim=await grantRequest('api/claim',{token:env.FRONTBASE_BOOTSTRAP_TOKEN},false);assert.equal(grantClaim.status,200);grantCookie=grantClaim.headers.get('set-cookie').split(';')[0];
+ const grantManifest=defaultDeploymentManifest('docker');
+ grantManifest.bindings['state-db']={adapterId:'supabase-postgres',mode:'create',config:{projectRef:'dockerproj',schema:'frontbase_edge_oauth_state'},secretRefs:{token:'oauth/supabase/token'}};
+ const grantReview=await grantRequest('api/review',{manifest:grantManifest});assert.equal(grantReview.status,200,'oauth grant binding passes review');
+ const {reviewId:grantReviewId}=await grantReview.json();
+ // Empty credentials: the browser never carries an oauth/ value; the resolver injects the grant refresh-first.
+ grantApplied=await grantRequest('api/apply',{reviewId:grantReviewId,credentials:{}});
+}finally{globalThis.fetch=previousFetch;}
+assert.equal(grantApplied.status,200);assert.equal((await grantApplied.json()).phase,'active','grant-resolved provisioning activates');
+assert.equal(refreshBodies.length,1);assert.equal(refreshBodies[0].get('grant_type'),'refresh_token');assert.equal(refreshBodies[0].get('refresh_token'),'expiring-apply-refresh');assert.equal(refreshBodies[0].get('client_id'),'sb-apply-client');
+assert.equal(grantCalls.length,2,'emptiness check then DDL');
+for(const call of grantCalls)assert.equal(call.init.headers.authorization,'Bearer '+grantToken);
+assert.match(JSON.parse(grantCalls.at(-1).init.body).query,/CREATE SCHEMA IF NOT EXISTS "frontbase_edge_oauth_state";/);
+assert.match(grantValues.APP_DB_URL,/^postgres:\/\/frontbase_edge_oauth_state_role:[^@]+@db\.dockerproj\.supabase\.co:5432\/postgres$/,'minted scoped-role DSN lowers, not the grant');
+assert.equal(grantValues.APP_DB_POSTGREST_TOKEN,undefined);
+for(const path of walkVolume(supaGrantDir)){const text=readFileSync(path,'utf8');assert.ok(!text.includes(grantToken)&&!text.includes('expiring-apply-token')&&!text.includes('expiring-apply-refresh'),'grant material persisted to the volume: '+path);}
+const persisted=JSON.parse(readFileSync(join(directory,'runtime.json'),'utf8'));assert.equal(persisted.environment.SESSION_SECRET,values.SESSION_SECRET);
+console.log('Docker hosted bootstrap: zero-state, ownership, origin, apply, setup handoff, restart, secret isolation and installed-state refusal PASS');

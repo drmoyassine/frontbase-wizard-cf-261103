@@ -1,0 +1,37 @@
+import assert from 'node:assert/strict';const {profileEnvironment}=await import(process.env.FRONTBASE_PROFILE_ENV_MODULE??'./deployment-setup/profile-environment.mjs');import {defaultDeploymentManifest,resolveDeploymentManifest,readManagedRuntimeManifest} from '../packages/edge-core/dist/deployment.js';
+const manifest=defaultDeploymentManifest('vercel');manifest.bindings['state-db'].config.url='https://state.example';manifest.bindings['state-db'].secretRefs.token='state/token';
+const credentials={'state/token':'synthetic-state-secret'},env=profileEnvironment({manifest,credentials});assert.equal(env.APP_DB_AUTH_TOKEN,credentials['state/token']);assert.ok(!env.FRONTBASE_DEPLOYMENT_MANIFEST.includes(credentials['state/token']));assert.deepEqual(readManagedRuntimeManifest(env.FRONTBASE_DEPLOYMENT_MANIFEST),manifest);
+assert.throws(()=>profileEnvironment({manifest,credentials:{}}));assert.throws(()=>profileEnvironment({manifest,credentials:{...credentials,other:'unreferenced'}}));
+manifest.bindings.cache={adapterId:'upstash-http',mode:'connect',config:{url:'https://cache.example'},secretRefs:{token:'cache/token'}};credentials['cache/token']='synthetic-cache-secret';assert.equal(JSON.parse(profileEnvironment({manifest,credentials}).FRONTBASE_CACHE).token,credentials['cache/token']);
+manifest.bindings.queue={adapterId:'qstash-http',mode:'connect',config:{destination:'https://app.example/wrong'},secretRefs:{token:'queue/token',signingKey:'queue/current',nextSigningKey:'queue/next'}};Object.assign(credentials,{'queue/token':'a','queue/current':'b','queue/next':'c'});assert.throws(()=>profileEnvironment({manifest,credentials}),/invalid_queue_callback/);manifest.bindings.queue.config.destination='https://app.example/api/system/queue/receive';assert.equal(profileEnvironment({manifest,credentials}).PUBLIC_URL,'https://app.example');
+console.log('PASS portable profile lowering: real resolver keys, referenced credentials only, safe metadata and exact queue callback');
+
+const native=defaultDeploymentManifest('vercel');native.bindings['state-db']={adapterId:'turso-marketplace',mode:'reuse',resourceRef:'store_test',config:{},secretRefs:{}};const nativeEnv=profileEnvironment({manifest:native,credentials:{}});assert.deepEqual(Object.keys(nativeEnv).sort(),['FRONTBASE_CACHE','FRONTBASE_QUEUE','FRONTBASE_VECTOR','FRONTBASE_STORAGE','FRONTBASE_DEPLOYMENT_MANIFEST'].sort());for(const key of ['FRONTBASE_CACHE','FRONTBASE_QUEUE','FRONTBASE_VECTOR'])assert.deepEqual(JSON.parse(nativeEnv[key]),{provider:'none'});assert.deepEqual(readManagedRuntimeManifest(nativeEnv.FRONTBASE_DEPLOYMENT_MANIFEST),native);
+const unsafe=structuredClone(native);unsafe.bindings['state-db'].config.apiKey='synthetic-forbidden';assert.equal(readManagedRuntimeManifest(unsafe),null);const cross=structuredClone(native);cross.target='cloudflare';assert.equal(readManagedRuntimeManifest(cross),null);console.log('PASS Marketplace profile metadata: native reference only, no local token transfer, unknown/cross-target refusal');
+
+const supa=(config,secretRefs)=>({adapterId:'supabase-postgres',mode:'connect',config,secretRefs});
+const postgrest=resolveDeploymentManifest('docker',undefined,{'state-db':supa({url:'https://api.example.test/rest/v1',schema:'frontbase_edge_state'},{token:'state/token'})});
+const postgrestEnv=profileEnvironment({manifest:postgrest,credentials:{'state/token':'synthetic-bearer'}});
+assert.equal(postgrestEnv.APP_DB_POSTGREST_URL,'https://api.example.test/rest/v1');assert.equal(postgrestEnv.APP_DB_POSTGREST_TOKEN,'synthetic-bearer');assert.equal(postgrestEnv.APP_DB_POSTGRES_SCHEMA,'frontbase_edge_state');
+assert.ok(!postgrestEnv.FRONTBASE_DEPLOYMENT_MANIFEST.includes('synthetic-bearer'));assert.ok(!('APP_DB_URL' in postgrestEnv));
+const wire=resolveDeploymentManifest('docker',undefined,{'state-db':supa({host:'db.example.test',port:'5432',database:'postgres',schema:'edge_state'},{username:'state/role',password:'state/role-secret'})});
+const wireEnv=profileEnvironment({manifest:wire,credentials:{'state/role':'edge role','state/role-secret':'p@ss:word'}});
+assert.equal(wireEnv.APP_DB_URL,'postgres://edge%20role:p%40ss%3Aword@db.example.test:5432/postgres');assert.equal(wireEnv.APP_DB_POSTGRES_SCHEMA,'edge_state');
+assert.ok(!wireEnv.FRONTBASE_DEPLOYMENT_MANIFEST.includes('p@ss:word'));assert.ok(!wireEnv.FRONTBASE_DEPLOYMENT_MANIFEST.includes('p%40ss%3Aword'));
+const cloudWire=resolveDeploymentManifest('cloudflare',undefined,{'state-db':supa({host:'db.example.test',database:'postgres'},{username:'state/role',password:'state/role-secret'})});
+assert.throws(()=>profileEnvironment({manifest:cloudWire,credentials:{'state/role':'r','state/role-secret':'s'}}),/state_wire_requires_hyperdrive/);
+// Only the native executor opts in: it lowers the opt-in flag plus the same encoded
+// DSN (the loud no-binding fallback), and nothing hyperdrive-shaped echoes elsewhere.
+const cloudNative=profileEnvironment({manifest:cloudWire,credentials:{'state/role':'r','state/role-secret':'s'}},{nativeHyperdrive:true});
+assert.equal(cloudNative.APP_DB_HYPERDRIVE,'1');assert.equal(cloudNative.APP_DB_URL,'postgres://r:s@db.example.test:5432/postgres');
+assert.ok(!('APP_DB_HYPERDRIVE' in wireEnv));assert.ok(!cloudNative.FRONTBASE_DEPLOYMENT_MANIFEST.includes('postgres://r:s@'));
+// Wave 0 (docs/plans/frontbase-wizard-provider-split-multistep-20261031.md): postgrest-http lowers
+// through the identical supabaseRunner HTTP transport pair — same env, same https-only source, no wire branch.
+const selfHosted=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'postgrest-http',mode:'connect',config:{url:'https://api.example.test/rest/v1',schema:'frontbase_edge_state'},secretRefs:{token:'state/token'}}});
+const selfHostedEnv=profileEnvironment({manifest:selfHosted,credentials:{'state/token':'synthetic-bearer'}});
+assert.equal(selfHostedEnv.APP_DB_POSTGREST_URL,postgrestEnv.APP_DB_POSTGREST_URL);assert.equal(selfHostedEnv.APP_DB_POSTGREST_TOKEN,postgrestEnv.APP_DB_POSTGREST_TOKEN);assert.equal(selfHostedEnv.APP_DB_POSTGRES_SCHEMA,postgrestEnv.APP_DB_POSTGRES_SCHEMA);
+assert.ok(!('APP_DB_URL' in selfHostedEnv));assert.ok(!('APP_DB_HYPERDRIVE' in selfHostedEnv));assert.ok(!selfHostedEnv.FRONTBASE_DEPLOYMENT_MANIFEST.includes('synthetic-bearer'));
+const vercelHosted=profileEnvironment({manifest:resolveDeploymentManifest('vercel',undefined,{'state-db':{adapterId:'postgrest-http',mode:'connect',config:{url:'https://api.example.test/rest/v1'},secretRefs:{token:'state/token'}}}),credentials:{'state/token':'synthetic-bearer'}});
+assert.equal(vercelHosted.APP_DB_POSTGREST_URL,'https://api.example.test/rest/v1');assert.equal(vercelHosted.APP_DB_POSTGREST_TOKEN,'synthetic-bearer');assert.ok(!('APP_DB_POSTGRES_SCHEMA' in vercelHosted));
+console.log('PASS supabase state lowering: PostgREST env identical on every host, encoded wire DSN without manifest echo, Cloudflare wire refused outside the Hyperdrive-provisioning executor');
+console.log('PASS postgrest-http lowering: identical supabase PostgREST pair on docker and vercel, optional schema, no wire branch');

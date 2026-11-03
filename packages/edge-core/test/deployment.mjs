@@ -1,0 +1,103 @@
+import assert from 'node:assert/strict';
+const { adaptersFor, defaultDeploymentManifest, resolveDeploymentManifest, validateDeploymentManifest, stateBindingChanged, readManagedRuntimeManifest, deploymentAdapters } = await import(process.env.FRONTBASE_DEPLOYMENT_TEST_MODULE || new URL('../dist/deployment.js', import.meta.url).href);
+let passed=0;
+const test=(label,fn)=>{fn();passed++;console.log('PASS '+label);};
+const disabledCache={adapterId:'cloudflare-kv',mode:'disabled',config:{},secretRefs:{}};
+const cf=()=>resolveDeploymentManifest('cloudflare',undefined,{cache:disabledCache});
+const remote={adapterId:'libsql-http',mode:'connect',config:{url:'https://state.example.com'},secretRefs:{token:'vault/test/state-token'}};
+const codes=(m)=>validateDeploymentManifest(m).issues.map(x=>x.code);
+test('target defaults are independent fresh values',()=>{const a=defaultDeploymentManifest('cloudflare');a.bindings['state-db'].config.resourceName='changed';assert.notEqual(defaultDeploymentManifest('cloudflare').bindings['state-db'].config.resourceName,'changed');assert.equal(defaultDeploymentManifest('vercel').bindings['state-db'].adapterId,'libsql-http');});
+test('native KV default is usable and R2 is optional',()=>{const m=defaultDeploymentManifest('cloudflare');assert.equal(validateDeploymentManifest(m).ready,true);assert.equal(m.bindings.storage.mode,'disabled');m.bindings.storage.mode='create';m.bindings.storage.config.resourceName='fixture-assets';assert.equal(validateDeploymentManifest(m).ready,true);m.bindings['email-send'].mode='reuse';m.bindings['email-send'].resourceRef='fixture';assert.ok(codes(m).includes('adapter_not_ready'));});
+test('explicit optional disable makes native state plan usable',()=>{const p=validateDeploymentManifest(cf());assert.equal(p.ready,true);assert.deepEqual(p.operations.map(x=>x.role),['state-db']);});
+test('state database cannot be disabled',()=>{const p=cf();p.bindings['state-db'].mode='disabled';assert.ok(codes(p).includes('required_binding_disabled'));});
+test('external state overrides CF native default without provider lock-in',()=>{const p=resolveDeploymentManifest('cloudflare',cf(),{'state-db':remote});assert.equal(validateDeploymentManifest(p).ready,true);assert.equal(p.bindings['state-db'].adapterId,'libsql-http');});
+test('saved user choices survive profile recommendation resolution',()=>{const saved=resolveDeploymentManifest('vercel',undefined,{'state-db':remote});assert.deepEqual(resolveDeploymentManifest('vercel',saved).bindings['state-db'],remote);});
+test('whole-binding override cannot retain old adapter secrets',()=>{const saved=resolveDeploymentManifest('cloudflare',cf(),{'state-db':remote});const changed=resolveDeploymentManifest('cloudflare',saved,{'state-db':cf().bindings['state-db']});assert.deepEqual(changed.bindings['state-db'].secretRefs,{});});
+test('Vercel dropdown excludes native D1 but offers HTTP state',()=>{const ids=adaptersFor('vercel','state-db').map(a=>a.id);assert.ok(!ids.includes('cloudflare-d1'));assert.ok(ids.includes('libsql-http'));assert.ok(adaptersFor('cloudflare','cache').some(a=>a.id==='cloudflare-kv'));assert.ok(!adaptersFor('vercel','cache').some(a=>a.id==='cloudflare-kv'));});
+test('cross-target saved configuration refuses implicit conversion',()=>assert.throws(()=>resolveDeploymentManifest('vercel',cf()),/target_mismatch/));
+test('missing secret references produce no provisioning operations',()=>{const p=resolveDeploymentManifest('vercel',undefined,{'state-db':{...remote,secretRefs:{}}});assert.ok(codes(p).includes('missing_secret_reference'));assert.equal(validateDeploymentManifest(p).operations.length,0);});
+test('raw credentials in nonsecret config refuse without echo',()=>{const p=cf();p.bindings['state-db'].config.apiKey='private-fixture';const out=validateDeploymentManifest(p);assert.equal(out.ready,false);assert.ok(!JSON.stringify(out).includes('private-fixture'));});
+test('credential-bearing and non-HTTP endpoints are refused',()=>{for(const url of ['https://user:private-fixture@state.example.com','postgres://state.example.com','https://state.example.com?token=private-fixture']){const p=resolveDeploymentManifest('vercel',undefined,{'state-db':{...remote,config:{url}}});assert.ok(codes(p).includes('invalid_public_endpoint'));}});
+test('reuse requires a resource reference and correct host',()=>{const p=cf();p.bindings['state-db'].mode='reuse';assert.ok(codes(p).includes('missing_resource_reference'));p.bindings['state-db'].resourceRef='resource/test-db';assert.equal(validateDeploymentManifest(p).ready,true);p.target='vercel';assert.ok(codes(p).includes('incompatible_adapter'));});
+test('state provider change requires migration, cache change does not',()=>{const before=cf();assert.equal(stateBindingChanged(before,resolveDeploymentManifest('cloudflare',before,{'state-db':remote})),true);assert.equal(stateBindingChanged(before,resolveDeploymentManifest('cloudflare',before,{cache:{adapterId:'upstash-http',mode:'disabled',config:{},secretRefs:{}}})),false);});
+test('invalid manifest fields never echo a rejected secret',()=>{const p=cf();p.target='private-fixture';assert.deepEqual(validateDeploymentManifest(p),{ready:false,issues:[{code:'invalid_manifest'}],operations:[]});});
+test('preview and production default resource names are separated',()=>assert.notEqual(defaultDeploymentManifest('cloudflare','preview').bindings['state-db'].config.resourceName,defaultDeploymentManifest('cloudflare','production').bindings['state-db'].config.resourceName));
+const supa=(config,secretRefs={})=>({adapterId:'supabase-postgres',mode:'connect',config,secretRefs});
+test('supabase PostgREST state connects over https with a private bearer',()=>{const p=resolveDeploymentManifest('docker',undefined,{'state-db':supa({url:'https://api.example.supabase.co/rest/v1',schema:'frontbase_edge_state'},{token:'vault/supa-bearer'})});const out=validateDeploymentManifest(p);assert.equal(out.ready,true);assert.equal(out.operations[0].adapterId,'supabase-postgres');assert.ok(readManagedRuntimeManifest(p));});
+test('supabase wire state connects from parts on every target without a credential-bearing DSN',()=>{for(const target of ['cloudflare','vercel','docker']){const p=resolveDeploymentManifest(target,target==='cloudflare'?cf():undefined,{'state-db':supa({host:'db.example.com',port:'5432',database:'postgres',schema:'frontbase_edge_state'},{username:'vault/role',password:'vault/role-secret'})});assert.equal(validateDeploymentManifest(p).ready,true,target+' wire connect');assert.ok(readManagedRuntimeManifest(p),target+' runtime manifest');}});
+test('supabase state refuses ambiguous transport, DSN-shaped urls and bad parts',()=>{
+ const codesOf=(m)=>validateDeploymentManifest(m).issues;
+ const neither=resolveDeploymentManifest('docker',undefined,{'state-db':supa({},{token:'vault/x'})});
+ assert.ok(codesOf(neither).some(i=>i.code==='state_transport_required'));
+ const both=resolveDeploymentManifest('docker',undefined,{'state-db':supa({url:'https://api.example.com',host:'db.example.com'},{token:'vault/x',username:'u',password:'p'})});
+ assert.ok(codesOf(both).some(i=>i.code==='state_transport_required'));
+ const mixed=resolveDeploymentManifest('docker',undefined,{'state-db':supa({url:'https://api.example.com',database:'postgres'},{token:'t',password:'p'})});
+ assert.ok(codesOf(mixed).some(i=>i.code==='state_transport_conflict'));
+ const noToken=resolveDeploymentManifest('docker',undefined,{'state-db':supa({url:'https://api.example.com'},{})});
+ assert.ok(codesOf(noToken).some(i=>i.code==='missing_secret_reference'&&i.field==='token'));
+ const dsn=resolveDeploymentManifest('docker',undefined,{'state-db':supa({url:'postgres://role:private-fixture@db.example.com/postgres'},{token:'vault/x'})});
+ assert.ok(codesOf(dsn).some(i=>i.code==='invalid_public_endpoint'));assert.ok(!JSON.stringify(codesOf(dsn)).includes('private-fixture'));
+ const noPassword=resolveDeploymentManifest('docker',undefined,{'state-db':supa({host:'db.example.com',database:'postgres'},{username:'vault/role'})});
+ assert.ok(codesOf(noPassword).some(i=>i.code==='missing_secret_reference'&&i.field==='password'));
+ const badParts=resolveDeploymentManifest('docker',undefined,{'state-db':supa({host:'bad host name',port:'99999',database:'postgres',schema:'bad schema'},{username:'u',password:'p'})});
+ assert.ok(codesOf(badParts).some(i=>i.code==='invalid_host'));assert.ok(codesOf(badParts).some(i=>i.code==='invalid_port'));assert.ok(codesOf(badParts).some(i=>i.code==='invalid_schema'));
+});
+test('supabase state create and reuse provision a fenced schema with the operator token',()=>{
+ const create=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'create',config:{projectRef:'fixtureproj',schema:'frontbase_edge_fixture_state'},secretRefs:{token:'vault/supa-pat'}}});
+ const planned=validateDeploymentManifest(create);assert.equal(planned.ready,true);assert.deepEqual(planned.operations[0],{role:'state-db',adapterId:'supabase-postgres',mode:'create'});
+ const reuse=resolveDeploymentManifest('vercel',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'reuse',resourceRef:'frontbase_edge_fixture_state',config:{projectRef:'fixtureproj'},secretRefs:{token:'vault/supa-pat'}}});
+ assert.equal(validateDeploymentManifest(reuse).ready,true);
+});
+test('supabase state create/reuse refuses transport mixing, bad names and missing references',()=>{
+ const codesOf=(m)=>validateDeploymentManifest(m).issues;
+ const noProject=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'create',config:{schema:'frontbase_edge_fixture_state'},secretRefs:{token:'vault/x'}}});
+ assert.ok(codesOf(noProject).some(i=>i.code==='missing_config'&&i.field==='projectRef'));
+ const noSchema=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'create',config:{projectRef:'fixtureproj'},secretRefs:{token:'vault/x'}}});
+ assert.ok(codesOf(noSchema).some(i=>i.code==='missing_config'&&i.field==='schema'));
+ const badSchema=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'create',config:{projectRef:'fixtureproj',schema:'public'},secretRefs:{token:'vault/x'}}});
+ assert.ok(codesOf(badSchema).some(i=>i.code==='invalid_schema'));
+ const badRef=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'reuse',resourceRef:'shared',config:{projectRef:'fixtureproj'},secretRefs:{token:'vault/x'}}});
+ assert.ok(codesOf(badRef).some(i=>i.code==='invalid_schema'&&i.field==='resourceRef'));
+ const noToken=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'create',config:{projectRef:'fixtureproj',schema:'frontbase_edge_fixture_state'},secretRefs:{}}});
+ assert.ok(codesOf(noToken).some(i=>i.code==='missing_secret_reference'&&i.field==='token'));
+ const mixedTransport=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'create',config:{projectRef:'fixtureproj',schema:'frontbase_edge_fixture_state',host:'db.example.com'},secretRefs:{token:'vault/x',username:'u',password:'p'}}});
+ assert.ok(codesOf(mixedTransport).some(i=>i.code==='state_transport_conflict'));
+ // D1 creation still requires its resourceName; supabase creation never asks for one.
+ const d1=cf();d1.bindings['state-db'].config.resourceName='';
+ assert.ok(codesOf(d1).some(i=>i.code==='missing_resource_name'));
+ assert.ok(!codesOf(noProject).some(i=>i.code==='missing_resource_name'));
+});
+// Wave 0 of docs/plans/frontbase-wizard-provider-split-multistep-20261031.md: the provider split contract.
+test('postgrest-http is a connect-only provider entry and supabase metadata is picker-driven',()=>{
+ assert.deepEqual(deploymentAdapters.find(a=>a.id==='postgrest-http'),{id:'postgrest-http',role:'state-db',targets:['cloudflare','vercel','docker'],selectable:true,modes:['connect'],configKeys:['url','schema'],secretKeys:['token'],requiredConfig:['url'],requiredSecrets:['token']});
+ assert.deepEqual(deploymentAdapters.find(a=>a.id==='supabase-postgres').configKeysByMode,{connect:['url','schema'],create:['projectRef','schema'],reuse:['projectRef','schema']});
+ assert.deepEqual(deploymentAdapters.find(a=>a.id==='supabase-postgres').secretKeys,['token','username','password']);
+ for(const target of ['cloudflare','vercel','docker'])assert.ok(adaptersFor(target,'state-db').some(a=>a.id==='postgrest-http'),target+' offers postgrest-http');
+});
+test('postgrest-http connects a self-hosted PostgREST endpoint on every target',()=>{for(const target of ['cloudflare','vercel','docker']){const p=resolveDeploymentManifest(target,target==='cloudflare'?cf():undefined,{'state-db':{adapterId:'postgrest-http',mode:'connect',config:{url:'https://postgrest.example.com',schema:'frontbase_edge_state'},secretRefs:{token:'vault/postgrest-bearer'}}});const out=validateDeploymentManifest(p);assert.equal(out.ready,true,target+' postgrest-http connect');assert.deepEqual(out.operations[0],{role:'state-db',adapterId:'postgrest-http',mode:'connect'});assert.ok(readManagedRuntimeManifest(p),target+' runtime manifest');}});
+test('postgrest-http refuses a missing bearer, plain http and unfenced schemas without echo',()=>{
+ const codesOf=(m)=>validateDeploymentManifest(m).issues;
+ const noToken=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'postgrest-http',mode:'connect',config:{url:'https://postgrest.example.com'},secretRefs:{}}});
+ assert.ok(codesOf(noToken).some(i=>i.code==='missing_secret_reference'&&i.field==='token'));
+ const http=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'postgrest-http',mode:'connect',config:{url:'http://postgrest.example.com'},secretRefs:{token:'vault/postgrest-bearer'}}});
+ assert.ok(codesOf(http).some(i=>i.code==='invalid_public_endpoint'));assert.ok(!JSON.stringify(codesOf(http)).includes('postgrest-bearer'));
+ const badSchema=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'postgrest-http',mode:'connect',config:{url:'https://postgrest.example.com',schema:'Bad Schema'},secretRefs:{token:'vault/postgrest-bearer'}}});
+ assert.ok(codesOf(badSchema).some(i=>i.code==='invalid_schema'&&i.field==='schema'));
+ const noUrl=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'postgrest-http',mode:'connect',config:{},secretRefs:{token:'vault/postgrest-bearer'}}});
+ assert.ok(codesOf(noUrl).some(i=>i.code==='missing_config'&&i.field==='url'));
+});
+test('picker-driven supabase reuse carries the picked schema and grant references validate like d1-http',()=>{
+ const grantReuse=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'reuse',resourceRef:'frontbase_edge_fixture_state',config:{projectRef:'fixtureproj',schema:'frontbase_edge_fixture_state'},secretRefs:{token:'oauth/supabase/token'}}});
+ const planned=validateDeploymentManifest(grantReuse);assert.equal(planned.ready,true);assert.deepEqual(planned.operations[0],{role:'state-db',adapterId:'supabase-postgres',mode:'reuse',resourceRef:'frontbase_edge_fixture_state'});
+ const grantCreate=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'create',config:{projectRef:'fixtureproj',schema:'frontbase_edge_fixture_state'},secretRefs:{token:'oauth/supabase/token'}}});
+ assert.equal(validateDeploymentManifest(grantCreate).ready,true);
+ const d1Grant=resolveDeploymentManifest('vercel',undefined,{'state-db':{adapterId:'d1-http',mode:'connect',config:{accountId:'a'.repeat(32),databaseId:'11111111-2222-3333-4444-555555555555'},secretRefs:{token:'oauth/cloudflare/token'}}});
+ assert.equal(validateDeploymentManifest(d1Grant).ready,true);
+ const mismatch=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'reuse',resourceRef:'frontbase_edge_fixture_state',config:{projectRef:'fixtureproj',schema:'frontbase_edge_other'},secretRefs:{token:'oauth/supabase/token'}}});
+ assert.ok(codes(mismatch).includes('invalid_schema'));
+});
+test('stored legacy supabase wire connect profiles keep validating under picker metadata',()=>{
+ const stored=resolveDeploymentManifest('docker',undefined,{'state-db':{adapterId:'supabase-postgres',mode:'connect',config:{host:'db.example.com',port:'5432',database:'postgres',schema:'frontbase_edge_state'},secretRefs:{username:'vault/role',password:'vault/role-secret'}}});
+ assert.equal(validateDeploymentManifest(stored).ready,true);assert.ok(readManagedRuntimeManifest(stored));
+});
+console.log(`${passed} deployment contract cases passed`);

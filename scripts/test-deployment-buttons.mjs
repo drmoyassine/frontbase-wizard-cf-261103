@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {nativeDeployButtons,verifyNativeButtons,verifyNativeSource,nativeSourceRef,nativeVercelIntegration} from './deployment-buttons.mjs';
+import {nativeSnapshotFiles} from './deployment-setup/native-snapshot.mjs';
+const read=p=>readFileSync(new URL('../'+p,import.meta.url),'utf8');
+assert.equal(verifyNativeButtons().ok,true,JSON.stringify(verifyNativeButtons().failures));
+const buttons=nativeDeployButtons();const v=new URL(buttons.vercel);assert.equal(v.searchParams.has('env'),false);assert.equal(v.searchParams.has('stores'),false);assert.match(v.searchParams.get('repository-url'),new RegExp(nativeSourceRef+'$'));
+assert.equal(v.searchParams.get('integration-ids'),nativeVercelIntegration);assert.equal(v.searchParams.get('redirect-url'),'https://oauth.frontbase.dev/native-vercel/complete');assert.equal(v.searchParams.get('external-id'),'frontbase-native-v1');
+assert.equal(new URL(nativeDeployButtons({hosted:false}).vercel).searchParams.has('integration-ids'),false);
+assert.throws(()=>nativeDeployButtons({ref:'codex/ambiguous'}));assert.throws(()=>nativeDeployButtons({name:'../bad'}));
+const snapshot=nativeSnapshotFiles({read,relay:'https://oauth.frontbase.dev',ref:nativeSourceRef,paths:[]});const snapRead=p=>snapshot[p]??read(p);
+assert.equal(verifyNativeButtons({read:snapRead,snapshot:true}).ok,true,JSON.stringify(verifyNativeButtons({read:snapRead,snapshot:true}).failures));
+for(const [p,replace] of [['README.md',s=>s.replace('root-directory=examples%2Fcf-full','root-directory=packages%2Fbackend')],['frontbase-native-settings.json',s=>s.replace('https://oauth.frontbase.dev','https://wrong.example')],['examples/cf-full/vercel.json',s=>s.replace('https://oauth.frontbase.dev','https://wrong.example')]])assert.equal(verifyNativeButtons({snapshot:true,read:x=>x===p?replace(snapRead(x)):snapRead(x)}).ok,false,p);
+const fetchImpl=async url=>{const p=url.pathname.split('/contents/')[1],content=snapRead(p);return new Response(JSON.stringify({type:'file',encoding:'base64',size:Buffer.byteLength(content),content:Buffer.from(content).toString('base64')}));};
+assert.equal((await verifyNativeSource({ref:nativeSourceRef,fetchImpl})).ok,true);
+assert.equal((await verifyNativeSource({fetchImpl:async()=>new Response('{}',{status:404})})).ok,false);
+console.log('PASS hosted native buttons, source snapshot and configuration refusal checks');

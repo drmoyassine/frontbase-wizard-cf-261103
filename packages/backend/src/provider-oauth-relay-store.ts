@@ -1,0 +1,67 @@
+import type {DbRunner} from '@frontbase/edge-infra';
+import type {OAuthRelayVault} from './provider-oauth-relay.js';
+import type {OAuthRelayTarget} from './provider-oauth-relay.js';
+/** Nonsecret native claim ledger. A new alias/build ID must not create a second owner. */
+export async function sqlOAuthNativeClaims(runner:DbRunner,now=Date.now,limit=1024){
+    if(!Number.isSafeInteger(limit)||limit<1||limit>100000)throw Error('native_claim_limit_refused');
+    await runner.exec('CREATE TABLE IF NOT EXISTS _frontbase_native_claims (resource TEXT PRIMARY KEY, installation_id TEXT NOT NULL, origin TEXT NOT NULL, receiver_proof TEXT NOT NULL, created_at INTEGER NOT NULL)');
+    return async(target:OAuthRelayTarget,proof:string)=>{
+        if(target.purpose!=='install'||!['cloudflare','vercel'].includes(target.host)||
+            !(target.host==='cloudflare'?/^[a-f0-9]{32}$/.test(target.account??'')&&/^[a-z0-9][a-z0-9-]{0,62}$/.test(target.project??''):/^team_[A-Za-z0-9]+$/.test(target.account??'')&&/^prj_[A-Za-z0-9]+$/.test(target.project??''))||
+            !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(target.installationId??'')||!/^[\w-]{43}$/.test(proof))throw Error('native_claim_refused');
+        const origin=new URL(target.origin);if(origin.origin!==target.origin||origin.protocol!=='https:')throw Error('native_claim_refused');
+        const resource=JSON.stringify([target.host,target.account,target.project,'production']);
+        const rows=await runner.query('INSERT INTO _frontbase_native_claims (resource,installation_id,origin,receiver_proof,created_at) SELECT ?,?,?,?,? WHERE (SELECT COUNT(*) FROM _frontbase_native_claims) < ? ON CONFLICT(resource) DO NOTHING RETURNING resource',[resource,target.installationId,target.origin,proof,now(),limit]);
+        return rows.length===1;
+    };
+}
+/** Match an installation's previously claimed receiver proof. The proof is a
+ * digest, not a credential; only a successfully claimed native installation
+ * can enroll. Ambiguous origins and malformed ledger entries fail closed. */
+export async function sqlOAuthNativeReceiver(runner:DbRunner){
+    await runner.exec('CREATE TABLE IF NOT EXISTS _frontbase_native_claims (resource TEXT PRIMARY KEY, installation_id TEXT NOT NULL, origin TEXT NOT NULL, receiver_proof TEXT NOT NULL, created_at INTEGER NOT NULL)');
+    await runner.exec('CREATE TABLE IF NOT EXISTS _frontbase_oauth_receivers (origin TEXT PRIMARY KEY, host TEXT NOT NULL, receiver_proof TEXT NOT NULL, created_at INTEGER NOT NULL)');
+    return async(target:OAuthRelayTarget,proof:string):Promise<boolean>=>{
+        if(target.purpose!=='connect'||!['cloudflare','vercel'].includes(target.host)||!/^[\w-]{43}$/.test(proof))return false;
+        try{
+            const origin=new URL(target.origin);if(origin.protocol!=='https:'||origin.origin!==target.origin||origin.port||origin.username||origin.password)return false;
+            const rows=await runner.query('SELECT resource FROM _frontbase_native_claims WHERE origin = ? AND receiver_proof = ? LIMIT 2',[target.origin,proof]);
+            if(rows.length===0){if((await runner.query('SELECT resource FROM _frontbase_native_claims WHERE origin = ? LIMIT 1',[target.origin])).length)return false;const enrolled=await runner.query('SELECT host FROM _frontbase_oauth_receivers WHERE origin = ? AND receiver_proof = ?',[target.origin,proof]);return enrolled.length===1&&enrolled[0]!.host===target.host;}
+            if(rows.length!==1)return false;
+            const resource=JSON.parse(String(rows[0]!.resource));
+            return Array.isArray(resource)&&resource.length===4&&resource[0]===target.host&&resource[3]==='production';
+        }catch{return false;}
+    };
+}
+
+/** Additional-provider receiver enrollment is not an installation ownership claim.
+ * The relay first reads this exact fingerprint from the canonical provider host.
+ * Only its private preimage can redeem an OAuth ticket. Existing claims win. */
+export async function sqlOAuthReceiverRegistration(runner:DbRunner,now=Date.now,limit=100000){
+    if(!Number.isSafeInteger(limit)||limit<1||limit>100000)throw Error('receiver_limit_refused');
+    await sqlOAuthNativeReceiver(runner);
+    return async(target:OAuthRelayTarget,proof:string)=>{
+        if(target.purpose!=='connect'||!['cloudflare','vercel'].includes(target.host)||!/^[\w-]{43}$/.test(proof))return false;
+        try{const url=new URL(target.origin);if(url.protocol!=='https:'||url.origin!==target.origin||url.port||url.username||url.password)return false;}catch{return false;}
+        const legacy=await runner.query('SELECT receiver_proof,resource FROM _frontbase_native_claims WHERE origin = ? LIMIT 2',[target.origin]);
+        if(legacy.length){if(legacy.length!==1||legacy[0]!.receiver_proof!==proof)return false;const resource=JSON.parse(String(legacy[0]!.resource));return resource[0]===target.host;}
+        await runner.query('INSERT INTO _frontbase_oauth_receivers (origin,host,receiver_proof,created_at) SELECT ?,?,?,? WHERE (SELECT COUNT(*) FROM _frontbase_oauth_receivers) < ? ON CONFLICT(origin) DO NOTHING RETURNING origin',[target.origin,target.host,proof,now(),limit]);
+        const rows=await runner.query('SELECT host,receiver_proof FROM _frontbase_oauth_receivers WHERE origin = ?',[target.origin]);
+        return rows.length===1&&rows[0]!.host===target.host&&rows[0]!.receiver_proof===proof;
+    };
+}
+/** Dedicated bounded expiring store; never uses or migrates an application's state database. */
+export async function sqlOAuthRelayVault(runner:DbRunner,now=Date.now):Promise<OAuthRelayVault>{
+    await runner.exec('CREATE TABLE IF NOT EXISTS _frontbase_oauth_relay (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER NOT NULL)');
+    await runner.exec('CREATE INDEX IF NOT EXISTS _frontbase_oauth_relay_expiry ON _frontbase_oauth_relay(expires_at)');
+    return {
+        get:async key=>{const rows=await runner.query('SELECT value FROM _frontbase_oauth_relay WHERE key = ? AND expires_at > ?',[key,now()]);return rows[0]?String(rows[0].value):null;},
+        entries:async prefix=>(await runner.query('SELECT key,value FROM _frontbase_oauth_relay WHERE key >= ? AND key < ? AND expires_at > ?',[prefix,prefix+'\uffff',now()])).map(row=>({key:String(row.key),value:String(row.value)})),
+        insert:async(key,value)=>{
+            if(!/^[A-Za-z0-9:._-]{1,256}$/.test(key)||value.length>65536||!value.startsWith('enc:'))throw Error('relay_record_refused');
+            const rows=await runner.query('INSERT INTO _frontbase_oauth_relay (key,value,expires_at) SELECT ?,?,? WHERE (SELECT COUNT(*) FROM _frontbase_oauth_relay) < 1024 ON CONFLICT(key) DO NOTHING RETURNING key',[key,value,now()+(key.startsWith('ticket:')?120000:600000)]);return rows.length===1;
+        },
+        take:async(key,expected)=>(await runner.query('DELETE FROM _frontbase_oauth_relay WHERE key = ? AND value = ? AND expires_at > ? RETURNING key',[key,expected,now()])).length===1,
+        purge:async()=>{await runner.exec('DELETE FROM _frontbase_oauth_relay WHERE expires_at <= ?',[now()]);},
+    };
+}

@@ -1,0 +1,22 @@
+/** Shared browser protocol: only authorization URLs and public status cross this boundary. */
+export interface ProviderConnectionStatus {
+    providers:Array<{provider:'cloudflare'|'vercel'|'supabase'|'upstash';available:boolean}>;
+    connections:Array<{id:string;provider:'cloudflare'|'vercel'|'supabase'|'upstash';label:string;accountId:string;reconnectRequired:boolean;capabilities?:string[]}>;
+}
+export async function readProviderConnections(retainedOnly=false):Promise<ProviderConnectionStatus>{
+    const response=await fetch('/api/provider-oauth/status'+(retainedOnly?'?view=connections':''),{credentials:'same-origin',cache:'no-store'});
+    if(!response.ok)throw Error('provider_connection_unavailable');return response.json();
+}
+export async function connectProvider(provider:'cloudflare'|'vercel'|'supabase'|'upstash',returnPath:string,accountId?:string){
+    const response=await fetch('/api/provider-oauth/'+provider+'/start',{method:'POST',credentials:'same-origin',headers:{'content-type':'application/json'},body:JSON.stringify({returnPath,...(accountId?{accountId}:{})})});
+    if(!response.ok)throw Error('provider_connection_unavailable');
+    const result=await response.json(),url=new URL(result.url);
+    const destination=result.relayOrigin??(provider==='cloudflare'?'https://dash.cloudflare.com':provider==='supabase'?'https://api.supabase.com':provider==='upstash'?'https://auth.upstash.com':'https://vercel.com');
+    if(url.protocol!=='https:'||url.origin!==destination)throw Error('provider_connection_unavailable');
+    location.assign(url.href);
+}
+export function connectionOptions(status:ProviderConnectionStatus){
+    const providers=new Map(status.providers.map(p=>[p.provider,p]));
+    for(const c of status.connections)if(!providers.has(c.provider))providers.set(c.provider,{provider:c.provider,available:false});
+    return Object.fromEntries([...providers.values()].map(p=>{const connection=status.connections.find(c=>c.provider===p.provider&&!c.reconnectRequired);return [p.provider,{available:p.available,connected:!!connection,label:connection?.label,accountId:connection?.accountId,capabilities:connection?.capabilities}];}));
+}
